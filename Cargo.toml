@@ -6,3 +6,6 @@ authors = ["Richard Dodd <richard.o.dodd@gmail.com>"]
 
 [dependencies]
 hyper = "*"
+regex = "*"
+regex_macros = "*"
+time = "*"
