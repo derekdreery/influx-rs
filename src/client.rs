@@ -1,66 +1,40 @@
-
-use std::default::Default;
+use time;
 use hyper;
 use regex;
-use time;
+use std::default::Default;
+use std::fmt;
 
-#[derive(Copy)]
 pub enum Protocol {
     Http,
     Https
 }
 
-/// A host represented by a hostname and port
-pub enum Host {
-    Single(String, u16),
-    Multi(Vec<(String, u16)>)
+impl fmt::String for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            &Protocol::Http => {
+                write!(f, "http")
+            },
+            &Protocol::Https => {
+                write!(f, "https")
+            }
+        }
+    }
 }
 
-pub struct Cluster {
+pub struct Host {
     pub protocol: Protocol,
-    pub host: Host,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    hyper_client: hyper::Client<hyper::net::HttpConnector>,
-    request_timeout: Option<u32>,
-    failover_timeout: u32
-}
-
-pub struct Database<'a> {
-    cluster: &'a Cluster,
-    pub name: String
+    pub hostname: String,
+    pub port: u16
 }
 
 pub struct ShardSpace {
     name: String,
     retention_policy: TimePeriod,
     shard_duration: TimePeriod,
-    regex: regex::Regex,
+    regex: String,
     replication_factory: u16,
     split: u16
-}
-
-pub struct DataPoint {
-    time: time::Timespec,
-    data: String
-}
-
-pub enum TimePeriod {
-    Days(usize)
-}
-
-impl Default for Cluster {
-    fn default() -> Cluster {
-        Cluster {
-            protocol: Protocol::Http,
-            host: Host::Single(String::from_str("localhost"), 8086),
-            username: None,
-            password: None,
-            hyper_client: hyper::Client::new(),
-            request_timeout: None,
-            failover_timeout: 60
-        }
-    }
 }
 
 impl Default for ShardSpace {
@@ -69,33 +43,66 @@ impl Default for ShardSpace {
             name: String::from_str(""),
             retention_policy: TimePeriod::Days(60),
             shard_duration: TimePeriod::Days(14),
-            regex: regex!(".*"),
+            regex: String::from_str(".*"),
             replication_factory: 1,
             split: 1
         }
     }
 }
 
-impl Cluster {
-    fn new(protocol: Protocol, host: String, port: u16,
-           username: String, password: String) -> Cluster {
+pub struct DataPoint {
+    pub time: time::Timespec,
+    pub data: String
+}
+
+pub enum TimePeriod {
+    // Add more variants
+    Days(u32)
+}
+
+pub struct Cluster {
+    pub username: String,
+    pub password: String,
+    hyper_client: hyper::Client<hyper::net::HttpConnector>,
+    request_timeout: Option<u32>,
+    failover_timeout: u32,
+    hosts_available: Vec<Host>,
+    hosts_disabled: Vec<Host>,
+    hosts_available_pointer: usize
+}
+
+impl Default for Cluster {
+    fn default() -> Cluster {
         Cluster {
-            protocol: protocol,
-            host: Host::Single(host, port),
-            username: Some(username),
-            password: Some(password),
-            ..Default::default()
+            username: String::from_str(""),
+            password: String::from_str(""),
+            hyper_client: hyper::Client::new(),
+            request_timeout: None,
+            failover_timeout: 60,
+            hosts_available: vec!(Host{
+                protocol: Protocol::Http,
+                hostname: String::from_str("localhost"),
+                port: 8086
+            }),
+            hosts_disabled: vec!(),
+            hosts_available_pointer: 0
         }
     }
+}
 
-    /// Private function to unwrap username/password
-    // TODO work out how to move this check into compiletime
-    #[inline]
-    fn check_auth(&self) -> (&str, &str) {
-        (
-            self.username.as_ref().expect("Set username before firing request").as_slice(),
-            self.password.as_ref().expect("Set password before firing request").as_slice()
-        )
+impl Cluster {
+    pub fn new(protocol: Protocol, hostname: String, port: u16,
+           username: String, password: String) -> Cluster {
+        Cluster {
+            hosts_available: vec!(Host{
+                protocol: protocol,
+                hostname: hostname,
+                port: port
+            }),
+            username: username,
+            password: password,
+            ..Default::default()
+        }
     }
 
     /// Create a new database - requires cluster admin privileges
@@ -144,24 +151,64 @@ impl Cluster {
     }
 
     /// Set request timeout - default None (disabled)
-    fn set_request_timeout(&mut self, value: Option<u32>) -> Result<(), String> {
-        unimplemented!();
+    pub fn set_request_timeout(&mut self, value: Option<u32>) {
+        self.request_timeout = value;
     }
 
     /// Set failover timeout - default 60s
-    fn set_failover_timeout(&mut self, value: u32) -> Result<(), String> {
-        unimplemented!();
+    pub fn set_failover_timeout(&mut self, value: u32) {
+        self.failover_timeout = value;
     }
 
     /// Get hosts available
-    fn get_hosts_available(&self) -> Vec<Host> {
-        unimplemented!();
+    pub fn get_hosts_available(&self) -> &Vec<Host> {
+        &self.hosts_available
     }
 
     /// Get hosts available
-    fn get_hosts_disabled(&self) -> Vec<Host> {
-        unimplemented!();
+    pub fn get_hosts_disabled(&self) -> &Vec<Host> {
+        &self.hosts_disabled
     }
+
+    // Private helper methods
+    fn get_host(&mut self) -> Option<&Host> {
+        if self.hosts_available.is_empty() {
+            None
+        } else {
+            if self.hosts_available_pointer > self.hosts_available.len() {
+                self.hosts_available_pointer = 0;
+            }
+            let host = &self.hosts_available[self.hosts_available_pointer];
+            self.hosts_available_pointer += 1;
+            Some(host)
+        }
+    }
+
+    fn enable_host(&mut self, pos: usize) {
+        let host = self.hosts_disabled.remove(pos);
+        self.hosts_available.push(host);
+    }
+
+    fn disable_host(&mut self, pos: usize) {
+        let host = self.hosts_available.remove(pos);
+        self.hosts_disabled.push(host);
+        // TODO schedule attempt to reenable
+    }
+
+    fn build_url(&self, pos: usize) -> String {
+        let host = &self.hosts_available[pos];
+        format!("{}://{}:{}/", host.protocol, host.hostname, host.port)
+    }
+
+    fn request(&mut self) {
+        let host = self.get_host().expect("No hosts left");
+        
+    }
+}
+
+pub struct Database<'a> {
+    cluster: &'a Cluster,
+    pub name: String
 }
 
 impl<'a> Database<'a> {
