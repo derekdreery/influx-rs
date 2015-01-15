@@ -3,10 +3,18 @@ use hyper;
 use regex;
 use std::default::Default;
 use std::fmt;
+use std::thread;
 
+/// Represents a url protocol
 pub enum Protocol {
     Http,
     Https
+}
+
+impl Default for Protocol {
+    fn default() -> Protocol {
+        Protocol::Http
+    }
 }
 
 impl fmt::String for Protocol {
@@ -22,12 +30,33 @@ impl fmt::String for Protocol {
     }
 }
 
+/// Represents a host & port
 pub struct Host {
     pub protocol: Protocol,
     pub hostname: String,
     pub port: u16
 }
 
+impl Default for Host {
+    fn default() -> Host {
+        Host {
+            protocol: Default::default(),
+            hostname: String::from_str("localhost"),
+            port: 8086
+        }
+    }
+}
+
+impl fmt::String for Host {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{protocol}://{hostname}:{port}",
+               protocol=self.protocol,
+               hostname=self.hostname,
+               port=self.port)
+    }
+}
+
+/// Represents a shard space
 pub struct ShardSpace {
     name: String,
     retention_policy: TimePeriod,
@@ -50,16 +79,21 @@ impl Default for ShardSpace {
     }
 }
 
+/// A datapoint consists of some serialized data and a timestamp
 pub struct DataPoint {
     pub time: time::Timespec,
     pub data: String
 }
 
+/// Handy enum for specifying time periods
 pub enum TimePeriod {
     // Add more variants
     Days(u32)
 }
 
+/// A cluster takes requests for operations and performs them
+/// on a cluster of influxdb instances, transparently handling
+/// replication/load balancing
 pub struct Cluster {
     pub username: String,
     pub password: String,
@@ -68,7 +102,8 @@ pub struct Cluster {
     failover_timeout: u32,
     hosts_available: Vec<Host>,
     hosts_disabled: Vec<Host>,
-    hosts_available_pointer: usize
+    hosts_available_pointer: usize,
+    thread_pool: Vec<thread::Thread>
 }
 
 impl Default for Cluster {
@@ -79,13 +114,10 @@ impl Default for Cluster {
             hyper_client: hyper::Client::new(),
             request_timeout: None,
             failover_timeout: 60,
-            hosts_available: vec!(Host{
-                protocol: Protocol::Http,
-                hostname: String::from_str("localhost"),
-                port: 8086
-            }),
+            hosts_available: vec!(Host::default()),
             hosts_disabled: vec!(),
-            hosts_available_pointer: 0
+            hosts_available_pointer: 0,
+            thread_pool: vec!()
         }
     }
 }
