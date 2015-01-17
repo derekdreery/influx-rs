@@ -1,66 +1,64 @@
 use time;
 use hyper;
 use regex;
+use url::{SchemeData, RelativeSchemeData, Host, Url};
 use std::default::Default;
 use std::fmt;
-use std::thread;
+use std::thread::Thread;
+use std::sync::{Arc, Mutex};
+use std::time::duration::Duration;
+use std::io;
 
-/// Represents a url protocol
-pub enum Protocol {
+/// Represents a url scheme
+#[derive(Show, Clone, Copy, PartialEq)]
+pub enum Scheme {
     Http,
     Https
 }
 
-impl Default for Protocol {
-    fn default() -> Protocol {
-        Protocol::Http
+impl Default for Scheme {
+    fn default() -> Scheme {
+        Scheme::Http
     }
 }
 
-impl fmt::String for Protocol {
+impl fmt::String for Scheme {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            &Protocol::Http => {
+            &Scheme::Http => {
                 write!(f, "http")
             },
-            &Protocol::Https => {
+            &Scheme::Https => {
                 write!(f, "https")
             }
         }
     }
 }
 
-/// Represents a host & port
-pub struct Host {
-    pub protocol: Protocol,
-    pub hostname: String,
+/// Represents a http-like scheme, host & port
+#[derive(Show, Clone, PartialEq)]
+pub struct Instance {
+    pub scheme: Scheme,
+    pub host: Host,
     pub port: u16
 }
 
-impl Default for Host {
-    fn default() -> Host {
-        Host {
-            protocol: Default::default(),
-            hostname: String::from_str("localhost"),
+impl Default for Instance {
+    fn default() -> Instance {
+        Instance {
+            scheme: Default::default(),
+            host: Host::Domain(String::from_str("127.0.0.1")),
             port: 8086
         }
     }
 }
 
-impl fmt::String for Host {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{protocol}://{hostname}:{port}",
-               protocol=self.protocol,
-               hostname=self.hostname,
-               port=self.port)
-    }
-}
-
 /// Represents a shard space
+#[derive(Show, Clone)]
 pub struct ShardSpace {
     name: String,
-    retention_policy: TimePeriod,
-    shard_duration: TimePeriod,
+    retention_policy: Duration,
+    shard_duration: Duration,
     regex: String,
     replication_factory: u16,
     split: u16
@@ -70,8 +68,8 @@ impl Default for ShardSpace {
     fn default() -> ShardSpace {
         ShardSpace {
             name: String::from_str(""),
-            retention_policy: TimePeriod::Days(60),
-            shard_duration: TimePeriod::Days(14),
+            retention_policy: Duration::days(60),
+            shard_duration: Duration::days(14),
             regex: String::from_str(".*"),
             replication_factory: 1,
             split: 1
@@ -81,14 +79,9 @@ impl Default for ShardSpace {
 
 /// A datapoint consists of some serialized data and a timestamp
 pub struct DataPoint {
+#[derive(Show, Clone)]
     pub time: time::Timespec,
     pub data: String
-}
-
-/// Handy enum for specifying time periods
-pub enum TimePeriod {
-    // Add more variants
-    Days(u32)
 }
 
 /// A cluster takes requests for operations and performs them
@@ -99,11 +92,11 @@ pub struct Cluster {
     pub password: String,
     hyper_client: hyper::Client<hyper::net::HttpConnector>,
     request_timeout: Option<u32>,
-    failover_timeout: u32,
-    hosts_available: Vec<Host>,
-    hosts_disabled: Vec<Host>,
-    hosts_available_pointer: usize,
-    thread_pool: Vec<thread::Thread>
+    failover_timeout: Arc<Mutex<Duration>>,
+    instances_available: Arc<Mutex<Vec<Instance>>>,
+    instances_disabled: Arc<Mutex<Vec<Instance>>>,
+    instances_available_pointer: Mutex<usize>,
+    pending_request_threads: Vec<Thread>
 }
 
 impl Default for Cluster {
@@ -113,24 +106,24 @@ impl Default for Cluster {
             password: String::from_str(""),
             hyper_client: hyper::Client::new(),
             request_timeout: None,
-            failover_timeout: 60,
-            hosts_available: vec!(Host::default()),
-            hosts_disabled: vec!(),
-            hosts_available_pointer: 0,
-            thread_pool: vec!()
+            failover_timeout: Arc::new(Mutex::new(Duration::seconds(60))),
+            instances_available: Arc::new(Mutex::new(vec!(Default::default()))),
+            instances_disabled: Arc::new(Mutex::new(vec!())),
+            instances_available_pointer: Mutex::new(0),
+            pending_request_threads: vec!()
         }
     }
 }
 
 impl Cluster {
-    pub fn new(protocol: Protocol, hostname: String, port: u16,
+    pub fn new(scheme: Scheme, host: Host, port: u16,
            username: String, password: String) -> Cluster {
         Cluster {
-            hosts_available: vec!(Host{
-                protocol: protocol,
-                hostname: hostname,
+            instances_available: Arc::new(Mutex::new(vec!(Instance{
+                scheme: scheme,
+                host: host,
                 port: port
-            }),
+            }))),
             username: username,
             password: password,
             ..Default::default()
@@ -138,8 +131,10 @@ impl Cluster {
     }
 
     /// Create a new database - requires cluster admin privileges
-    pub fn create_database(&self, name: String) -> Result<(), String> {
-        unimplemented!();
+    pub fn create_database(&mut self, name: String) -> Result<(), String> {
+        self.request(vec!(String::from_str("cluster"),
+                          String::from_str("database_configs"),
+                          name))
     }
 
     /// Delete a database - requires cluster admin privileges
@@ -188,52 +183,99 @@ impl Cluster {
     }
 
     /// Set failover timeout - default 60s
-    pub fn set_failover_timeout(&mut self, value: u32) {
-        self.failover_timeout = value;
+    pub fn set_failover_timeout(&mut self, value: Duration) {
+        *self.failover_timeout.lock().unwrap() = value;
     }
 
-    /// Get hosts available
-    pub fn get_hosts_available(&self) -> &Vec<Host> {
-        &self.hosts_available
+    /// Returns a copy of the vector of available hosts
+    pub fn get_instances_available(&self) -> Vec<Instance> {
+        (*self.instances_available).lock().unwrap().clone()
     }
 
-    /// Get hosts available
-    pub fn get_hosts_disabled(&self) -> &Vec<Host> {
-        &self.hosts_disabled
+    /// Returns a copy of the vector of disabled hosts
+    pub fn get_instances_disabled(&self) -> Vec<Instance> {
+        (*self.instances_disabled).lock().unwrap().clone()
     }
 
     // Private helper methods
-    fn get_host(&mut self) -> Option<&Host> {
-        if self.hosts_available.is_empty() {
+    // ======================
+
+    /// Add a new host to available hosts
+    fn add_host(&mut self, new_host: Instance) {
+        self.instances_available.lock().unwrap().push(new_host);
+    }
+
+    fn get_host(&mut self) -> Option<Instance> {
+        let instances_available = self.instances_available.lock().unwrap();
+        let mut instances_available_pointer = self.instances_available_pointer.lock().unwrap();
+        if instances_available.is_empty() {
             None
         } else {
-            if self.hosts_available_pointer > self.hosts_available.len() {
-                self.hosts_available_pointer = 0;
+            if *instances_available_pointer > instances_available.len() {
+                *instances_available_pointer = 0;
             }
-            let host = &self.hosts_available[self.hosts_available_pointer];
-            self.hosts_available_pointer += 1;
+            let host = instances_available[*instances_available_pointer].clone();
+            *instances_available_pointer += 1;
             Some(host)
         }
     }
 
     fn enable_host(&mut self, pos: usize) {
-        let host = self.hosts_disabled.remove(pos);
-        self.hosts_available.push(host);
+        let host = self.instances_disabled.lock().unwrap().remove(pos);
+        self.instances_available.lock().unwrap().push(host);
     }
 
     fn disable_host(&mut self, pos: usize) {
-        let host = self.hosts_available.remove(pos);
-        self.hosts_disabled.push(host);
-        // TODO schedule attempt to reenable
+        let host = self.instances_available.lock().unwrap().remove(pos);
+        self.instances_disabled.lock().unwrap().push(host.clone());
+        // schedule attempt to reenable
+        let instances_disabled = self.instances_disabled.clone();
+        let instances_available = self.instances_available.clone();
+        let timeout = self.failover_timeout.lock().unwrap().clone();
+        Thread::spawn(move || {
+            io::timer::sleep(timeout);
+            Cluster::remove_instance_by_attrs(instances_disabled, host.clone());
+            instances_available.lock().unwrap().push(host);
+        });
     }
 
-    fn build_url(&self, pos: usize) -> String {
-        let host = &self.hosts_available[pos];
-        format!("{}://{}:{}/", host.protocol, host.hostname, host.port)
+    /// Helper function to remote a host by attrs
+    ///
+    /// We do this because we cannot garuntee the position of the host (as
+    /// other hosts will have been removed/added since)
+    fn remove_instance_by_attrs(instances: Arc<Mutex<Vec<Instance>>>,
+                                instance: Instance) {
+        let mut instances = instances.lock().unwrap();
+        instances.retain(|ref x| **x != instance);
     }
 
-    fn request(&mut self) {
-        let host = self.get_host().expect("No hosts left");
+    /// Creates a url for a request
+    fn build_url(&self,
+                 instance: Instance,
+                 path: Vec<String>,
+                 query: &mut Vec<(String, String)>) -> Url {
+        query.push((String::from_str("u"), self.username.clone()));
+        query.push((String::from_str("p"), self.password.clone()));
+        Url {
+            scheme: format!("{}", instance.scheme),
+            scheme_data: SchemeData::Relative(RelativeSchemeData {
+                username: String::from_str(""),
+                password: None,
+                host: instance.host.clone(),
+                port: Some(instance.port),
+                default_port: Some(instance.port), // TODO what to do here?
+                path: path
+            }),
+            query: Some(::url::form_urlencoded::serialize_owned(query.as_slice())),
+            fragment: None
+        }
+    }
+
+    // TODO write this when we know what we want
+    fn request(&mut self, path: Vec<String>) {
+        // TODO handle no hosts more gracefully
+        let instance = self.get_host().expect("No hosts left");
+        self.build_url(instance, path, &vec!());
         
     }
 }
