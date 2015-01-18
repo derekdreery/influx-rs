@@ -9,10 +9,11 @@ extern crate regex;
 #[plugin] #[no_link] extern crate regex_macros;
 extern crate time;
 
-pub use client::Cluster;
-pub use client::Scheme;
+pub use client::Influx;
+pub use transport::Scheme;
 
-mod client;
+pub mod client;
+mod transport;
 
 #[test]
 fn it_works() {
